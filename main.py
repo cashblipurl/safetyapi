@@ -10,9 +10,9 @@ from firebase_admin import credentials, messaging
 
 
 # ---------- INIT FIREBASE ----------
-if not firebase_admin._apps:
-    cred = credentials.Certificate("firebase.json")
-    firebase_admin.initialize_app(cred)
+#if not firebase_admin._apps:
+ #   cred = credentials.Certificate("firebase.json")
+   # firebase_admin.initialize_app(cred)
 
 # ---------- DB ----------
 MONGO_URI = os.environ.get("MONGO_URI")
