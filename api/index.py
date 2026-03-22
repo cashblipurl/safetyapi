@@ -5,27 +5,10 @@ import uuid
 import jwt
 import datetime
 from pymongo import MongoClient
-import firebase_admin
-from firebase_admin import credentials, messaging
 from fastapi import FastAPI, Request
 
 # ---------- FASTAPI APP ----------
 app = FastAPI()
-
-# ---------- FIREBASE INIT ----------
-if not firebase_admin._apps:
-    firebase_raw = os.environ.get("FIREBASE_JSON")
-
-    if not firebase_raw:
-        raise Exception("FIREBASE_JSON env variable not set")
-
-    firebase_dict = json.loads(firebase_raw)
-
-    # 🔥 FIX: handle escaped newlines in private key
-    firebase_dict["private_key"] = firebase_dict["private_key"].replace("\\n", "\n")
-
-    cred = credentials.Certificate(firebase_dict)
-    firebase_admin.initialize_app(cred)
 
 # ---------- DB ----------
 MONGO_URI = os.environ.get("MONGO_URI")
@@ -159,6 +142,11 @@ def register_device(claims, data):
             "username": claims["username"],
             "device_id": data.get("device_id")
         },
+        {"$set": {
+            "username": claims["username"],
+            "device_id": data.get("device_id"),
+            "updated_at": now_iso()
+        }},
         upsert=True
     )
 
@@ -189,37 +177,13 @@ def trigger_sos(claims, data):
         "created_at": now_iso()
     })
 
-    devices = list(devices_tbl.find({"username": client_username}))
-    # tokens = [d["fcm_token"] for d in devices if d.get("fcm_token")]
-
-    # if tokens:
-    #     send_fcm(tokens, username, alert_id, data)
-
     return json_resp(200, {
         "message": "SOS sent",
         "alert_id": alert_id
     })
 
 
-# ---------- FCM ----------
-def send_fcm(tokens, user, alert_id, data):
-    message = messaging.MulticastMessage(
-        tokens=tokens,
-        notification=messaging.Notification(
-            title="🚨 SOS Alert",
-            body=f"{user} needs help"
-        ),
-        data={
-            "type": "sos",
-            "alert_id": alert_id,
-            "lat": str(data.get("lat", "")),
-            "lng": str(data.get("lng", ""))
-        }
-    )
-
-    messaging.send_multicast(message)
-
-# ---------- FASTAPI ROUTE (ENTRY POINT) ----------
+# ---------- FASTAPI ROUTES ----------
 @app.post("/")
 async def root(request: Request):
     try:
@@ -234,10 +198,10 @@ async def root(request: Request):
 
     return handler(DummyRequest())
 
+
 @app.get("/health")
 async def health():
     try:
-        # Optional DB ping
         client.admin.command('ping')
 
         return {
@@ -250,6 +214,7 @@ async def health():
             "status": "error",
             "message": str(e)
         }
+
 
 @app.get("/")
 async def root_get():
