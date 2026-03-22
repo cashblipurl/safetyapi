@@ -1,3 +1,5 @@
+fastapi
 pymongo
 pyjwt
 firebase-admin
+uvicorn
