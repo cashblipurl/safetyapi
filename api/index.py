@@ -43,28 +43,15 @@ def verify_jwt(token):
     except:
         return None
 
-def json_resp(code, obj):
-    return {
-        "statusCode": code,
-        "headers": {"Content-Type": "application/json"},
-        "body": json.dumps(obj)
-    }
-
 def auth(headers, body):
     token = headers.get("authorization", "").replace("Bearer ", "")
     if not token:
         token = body.get("token")
     return verify_jwt(token) if token else None
 
-# ---------- CORE HANDLER ----------
-def handler(request):
-    try:
-        body = request.get_json()
-    except:
-        return json_resp(400, {"error": "Invalid JSON"})
-
+# ---------- CORE LOGIC ----------
+def process_request(body, headers):
     action = body.get("action")
-    headers = request.headers
 
     if action == "register":
         return register(body)
@@ -77,7 +64,7 @@ def handler(request):
 
     claims = auth(headers, body)
     if not claims:
-        return json_resp(401, {"error": "Unauthorized"})
+        return {"error": "Unauthorized"}
 
     if action == "registerDevice":
         return register_device(claims, body)
@@ -85,12 +72,12 @@ def handler(request):
     if action == "triggerSOS":
         return trigger_sos(claims, body)
 
-    return json_resp(400, {"error": "Invalid action"})
+    return {"error": "Invalid action"}
 
 # ---------- APIs ----------
 def register(data):
     if users_tbl.find_one({"username": data["username"]}):
-        return json_resp(400, {"error": "User exists"})
+        return {"error": "User exists"}
 
     users_tbl.insert_one({
         "username": data["username"],
@@ -102,38 +89,38 @@ def register(data):
         "created_at": now_iso()
     })
 
-    return json_resp(200, {"message": "Registered"})
+    return {"message": "Registered"}
 
 
 def login(data):
     user = users_tbl.find_one({"username": data["username"]})
     if not user or user["password"] != hash_password(data["password"]):
-        return json_resp(400, {"error": "Invalid credentials"})
+        return {"error": "Invalid credentials"}
 
     token = create_jwt(user["username"], user["role"])
 
-    return json_resp(200, {
+    return {
         "token": token,
         "role": user["role"],
         "unique_code": user.get("unique_code")
-    })
+    }
 
 
 def connect_client(data):
     user = users_tbl.find_one({"username": data["username"]})
 
     if not user:
-        return json_resp(400, {"error": "User not found"})
+        return {"error": "User not found"}
 
     if user["unique_code"] != data["unique_code"]:
-        return json_resp(400, {"error": "Invalid code"})
+        return {"error": "Invalid code"}
 
     users_tbl.update_one(
         {"username": data["username"]},
         {"$set": {"linked_client": data["client_username"]}}
     )
 
-    return json_resp(200, {"message": "Connected"})
+    return {"message": "Connected"}
 
 
 def register_device(claims, data):
@@ -142,15 +129,17 @@ def register_device(claims, data):
             "username": claims["username"],
             "device_id": data.get("device_id")
         },
-        {"$set": {
-            "username": claims["username"],
-            "device_id": data.get("device_id"),
-            "updated_at": now_iso()
-        }},
+        {
+            "$set": {
+                "username": claims["username"],
+                "device_id": data.get("device_id"),
+                "updated_at": now_iso()
+            }
+        },
         upsert=True
     )
 
-    return json_resp(200, {"message": "Device saved"})
+    return {"message": "Device saved"}
 
 
 # ---------- SOS ----------
@@ -161,7 +150,7 @@ def trigger_sos(claims, data):
     client_username = user.get("linked_client")
 
     if not client_username:
-        return json_resp(400, {"error": "No client linked"})
+        return {"error": "No client linked"}
 
     alert_id = str(uuid.uuid4())
 
@@ -177,33 +166,27 @@ def trigger_sos(claims, data):
         "created_at": now_iso()
     })
 
-    return json_resp(200, {
+    return {
         "message": "SOS sent",
         "alert_id": alert_id
-    })
+    }
 
-
-# ---------- FASTAPI ROUTES ----------
+# ---------- ROUTES ----------
 @app.post("/")
 async def root(request: Request):
     try:
         body = await request.json()
     except:
-        return json_resp(400, {"error": "Invalid JSON"})
+        return {"error": "Invalid JSON"}
 
-    class DummyRequest:
-        def get_json(self):
-            return body
-        headers = dict(request.headers)
-
-    return handler(DummyRequest())
+    headers = dict(request.headers)
+    return process_request(body, headers)
 
 
 @app.get("/health")
 async def health():
     try:
         client.admin.command('ping')
-
         return {
             "status": "ok",
             "service": "womensafety-api",
@@ -218,6 +201,4 @@ async def health():
 
 @app.get("/")
 async def root_get():
-    return {
-        "message": "API is running 🚀"
-    }
+    return {"message": "API is running 🚀"}
