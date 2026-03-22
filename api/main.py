@@ -239,3 +239,26 @@ async def root(request: Request):
         headers = dict(request.headers)
 
     return handler(DummyRequest())
+
+@app.get("/health")
+async def health():
+    try:
+        # Optional DB ping
+        client.admin.command('ping')
+
+        return {
+            "status": "ok",
+            "service": "womensafety-api",
+            "time": datetime.datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+    
+@app.get("/")
+async def root_get():
+    return {
+        "message": "API is running 🚀"
+    }
