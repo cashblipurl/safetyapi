@@ -7,12 +7,25 @@ import datetime
 from pymongo import MongoClient
 import firebase_admin
 from firebase_admin import credentials, messaging
+from fastapi import FastAPI, Request
 
+# ---------- FASTAPI APP ----------
+app = FastAPI()
 
-# ---------- INIT FIREBASE ----------
-#if not firebase_admin._apps:
- #   cred = credentials.Certificate("firebase.json")
-   # firebase_admin.initialize_app(cred)
+# ---------- FIREBASE INIT ----------
+if not firebase_admin._apps:
+    firebase_raw = os.environ.get("FIREBASE_JSON")
+
+    if not firebase_raw:
+        raise Exception("FIREBASE_JSON env variable not set")
+
+    firebase_dict = json.loads(firebase_raw)
+
+    # 🔥 FIX: handle escaped newlines in private key
+    firebase_dict["private_key"] = firebase_dict["private_key"].replace("\\n", "\n")
+
+    cred = credentials.Certificate(firebase_dict)
+    firebase_admin.initialize_app(cred)
 
 # ---------- DB ----------
 MONGO_URI = os.environ.get("MONGO_URI")
@@ -60,7 +73,7 @@ def auth(headers, body):
         token = body.get("token")
     return verify_jwt(token) if token else None
 
-# ---------- HANDLER ----------
+# ---------- CORE HANDLER ----------
 def handler(request):
     try:
         body = request.get_json()
@@ -92,7 +105,6 @@ def handler(request):
     return json_resp(400, {"error": "Invalid action"})
 
 # ---------- APIs ----------
-
 def register(data):
     if users_tbl.find_one({"username": data["username"]}):
         return json_resp(400, {"error": "User exists"})
@@ -183,7 +195,6 @@ def trigger_sos(claims, data):
         "created_at": now_iso()
     })
 
-    # get devices
     devices = list(devices_tbl.find({"username": client_username}))
     tokens = [d["fcm_token"] for d in devices if d.get("fcm_token")]
 
@@ -214,18 +225,17 @@ def send_fcm(tokens, user, alert_id, data):
 
     messaging.send_multicast(message)
 
-#
-# from fastapi import FastAPI, Request
-#
-# app = FastAPI()
-#
-# @app.post("/")
-# async def root(request: Request):
-#     body = await request.json()
-#
-#     class DummyRequest:
-#         def get_json(self):
-#             return body
-#         headers = dict(request.headers)
-#
-#     return handler(DummyRequest())
+# ---------- FASTAPI ROUTE (ENTRY POINT) ----------
+@app.post("/")
+async def root(request: Request):
+    try:
+        body = await request.json()
+    except:
+        return json_resp(400, {"error": "Invalid JSON"})
+
+    class DummyRequest:
+        def get_json(self):
+            return body
+        headers = dict(request.headers)
+
+    return handler(DummyRequest())
