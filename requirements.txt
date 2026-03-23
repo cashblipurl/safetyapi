@@ -3,3 +3,4 @@ pymongo
 pyjwt
 firebase-admin
 uvicorn
+requests
