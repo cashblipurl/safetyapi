@@ -6,11 +6,15 @@ import jwt
 import datetime
 from pymongo import MongoClient
 from fastapi import FastAPI, Request
+import requests
 
 # ---------- FASTAPI APP ----------
 app = FastAPI()
 
 # ---------- DB ----------
+
+ONESIGNAL_APP_ID = os.getenv("ONESIGNAL_APP_ID")
+ONESIGNAL_API_KEY = os.getenv("ONESIGNAL_API_KEY")
 MONGO_URI = os.environ.get("MONGO_URI")
 client = MongoClient(MONGO_URI)
 db = client["womensafety"]
@@ -74,6 +78,31 @@ def process_request(body, headers):
 
     return {"error": "Invalid action"}
 
+
+def send_push_notification(player_ids, message, extra_data=None):
+    if not player_ids:
+        return {"error": "No player_ids"}
+
+    url = "https://onesignal.com/api/v1/notifications"
+
+    payload = {
+        "app_id": ONESIGNAL_APP_ID,
+        "include_player_ids": player_ids,
+        "contents": {"en": message},
+        "data": extra_data or {}
+    }
+
+    headers = {
+        "Authorization": f"Basic {ONESIGNAL_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        res = requests.post(url, json=payload, headers=headers)
+        return res.json()
+    except Exception as e:
+        return {"error": str(e)}
+
 # ---------- APIs ----------
 def register(data):
     if users_tbl.find_one({"username": data["username"]}):
@@ -124,6 +153,9 @@ def connect_client(data):
 
 
 def register_device(claims, data):
+    if not data.get("device_id") or not data.get("player_id"):
+        return {"error": "device_id and player_id required"}
+
     devices_tbl.update_one(
         {
             "username": claims["username"],
@@ -133,6 +165,7 @@ def register_device(claims, data):
             "$set": {
                 "username": claims["username"],
                 "device_id": data.get("device_id"),
+                "player_id": data.get("player_id"),  # 🔥 STORE THIS
                 "updated_at": now_iso()
             }
         },
@@ -166,9 +199,31 @@ def trigger_sos(claims, data):
         "created_at": now_iso()
     })
 
+    # 🔥 GET ALL DEVICES OF CLIENT
+    devices = devices_tbl.find({"username": client_username})
+
+    player_ids = []
+    for d in devices:
+        if d.get("player_id"):
+            player_ids.append(d["player_id"])
+
+    # 🔥 SEND NOTIFICATION TO ALL DEVICES
+    if player_ids:
+        send_push_notification(
+            player_ids,
+            f"🚨 SOS Alert from {username}",
+            {
+                "alert_id": alert_id,
+                "lat": data.get("lat"),
+                "lng": data.get("lng"),
+                "type": "SOS"
+            }
+        )
+
     return {
         "message": "SOS sent",
-        "alert_id": alert_id
+        "alert_id": alert_id,
+        "notified_devices": len(player_ids)
     }
 
 # ---------- ROUTES ----------
