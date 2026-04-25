@@ -1,21 +1,24 @@
 import os
-import json
-import hashlib
 import uuid
-import jwt
 import datetime
-from pymongo import MongoClient
-from fastapi import FastAPI, Request
-import requests
+import jwt
+import httpx
 
-# ---------- FASTAPI APP ----------
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, Depends
+from pymongo import MongoClient
+from passlib.context import CryptContext
+
+# ---------- CONFIG ----------
+MONGO_URI = os.getenv("MONGO_URI")
+ONESIGNAL_APP_ID = os.getenv("ONESIGNAL_APP_ID")
+ONESIGNAL_API_KEY = os.getenv("ONESIGNAL_API_KEY")
+JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS")
+JWT_ALGO = "HS256"
+
+# ---------- APP ----------
 app = FastAPI()
 
 # ---------- DB ----------
-
-ONESIGNAL_APP_ID = os.getenv("ONESIGNAL_APP_ID")
-ONESIGNAL_API_KEY = os.getenv("ONESIGNAL_API_KEY")
-MONGO_URI = os.environ.get("MONGO_URI")
 client = MongoClient(MONGO_URI)
 db = client["womensafety"]
 
@@ -23,23 +26,33 @@ users_tbl = db["users"]
 devices_tbl = db["devices"]
 alerts_tbl = db["alerts"]
 
-# ---------- AUTH ----------
-JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS")
-JWT_ALGO = "HS256"
+# ---------- INDEXES ----------
+devices_tbl.create_index("device_id", unique=True)
+devices_tbl.create_index("username")
+alerts_tbl.create_index("user")
+alerts_tbl.create_index([("location", "2dsphere")])
 
-# ---------- UTILS ----------
-def now_iso():
-    return datetime.datetime.utcnow().isoformat()
+# ---------- PASSWORD HASH ----------
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
+    return pwd_context.hash(password)
+
+def verify_password(password, hashed):
+    return pwd_context.verify(password, hashed)
+
+# ---------- UTILS ----------
+def now():
+    return datetime.datetime.utcnow()
 
 def create_jwt(username, role):
-    return jwt.encode({
+    payload = {
         "username": username,
         "role": role,
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=2)
-    }, JWT_SECRET, algorithm=JWT_ALGO)
+        "exp": now() + datetime.timedelta(hours=2),
+        "iat": now()
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
 
 def verify_jwt(token):
     try:
@@ -47,41 +60,25 @@ def verify_jwt(token):
     except:
         return None
 
-def auth(headers, body):
-    token = headers.get("authorization", "").replace("Bearer ", "")
+def get_current_user(request: Request):
+    token = request.headers.get("authorization", "").replace("Bearer ", "")
     if not token:
-        token = body.get("token")
-    return verify_jwt(token) if token else None
+        raise HTTPException(401, "Missing token")
 
-# ---------- CORE LOGIC ----------
-def process_request(body, headers):
-    action = body.get("action")
-
-    if action == "register":
-        return register(body)
-
-    if action == "login":
-        return login(body)
-
-    if action == "connectClient":
-        return connect_client(body)
-
-    claims = auth(headers, body)
+    claims = verify_jwt(token)
     if not claims:
-        return {"error": "Unauthorized"}
+        raise HTTPException(401, "Invalid token")
 
-    if action == "registerDevice":
-        return register_device(claims, body)
+    user = users_tbl.find_one({"username": claims["username"]})
+    if not user:
+        raise HTTPException(401, "User not found")
 
-    if action == "triggerSOS":
-        return trigger_sos(claims, body)
+    return user
 
-    return {"error": "Invalid action"}
-
-
-def send_push_notification(player_ids, message, extra_data=None):
+# ---------- NOTIFICATION ----------
+async def send_push_notification(player_ids, message, extra_data=None):
     if not player_ids:
-        return {"error": "No player_ids"}
+        return
 
     url = "https://onesignal.com/api/v1/notifications"
 
@@ -97,163 +94,135 @@ def send_push_notification(player_ids, message, extra_data=None):
         "Content-Type": "application/json"
     }
 
-    try:
-        res = requests.post(url, json=payload, headers=headers)
-        return res.json()
-    except Exception as e:
-        return {"error": str(e)}
+    async with httpx.AsyncClient(timeout=5) as client:
+        try:
+            await client.post(url, json=payload, headers=headers)
+        except Exception as e:
+            print("Push error:", str(e))
 
-# ---------- APIs ----------
-def register(data):
+# ---------- AUTH ----------
+@app.post("/register")
+async def register(data: dict):
     if users_tbl.find_one({"username": data["username"]}):
-        return {"error": "User exists"}
+        raise HTTPException(400, "User exists")
 
     users_tbl.insert_one({
         "username": data["username"],
-        "phone": data["phone"],
-        "email": data["email"],
+        "phone": data.get("phone"),
+        "email": data.get("email"),
         "password": hash_password(data["password"]),
-        "role": data.get("role", "user"),
+        "role": "user",
         "unique_code": str(uuid.uuid4())[:8],
-        "created_at": now_iso()
+        "linked_client": None,
+        "created_at": now()
     })
 
-    return {"message": "Registered"}
+    return {"message": "Registered successfully"}
 
-
-def login(data):
+@app.post("/login")
+async def login(data: dict):
     user = users_tbl.find_one({"username": data["username"]})
-    if not user or user["password"] != hash_password(data["password"]):
-        return {"error": "Invalid credentials"}
+
+    if not user or not verify_password(data["password"], user["password"]):
+        raise HTTPException(401, "Invalid credentials")
 
     token = create_jwt(user["username"], user["role"])
 
     return {
         "token": token,
-        "role": user["role"],
-        "unique_code": user.get("unique_code")
+        "unique_code": user["unique_code"]
     }
 
+# ---------- LINK CONTACT ----------
+@app.post("/connect")
+async def connect(data: dict, user=Depends(get_current_user)):
+    client = users_tbl.find_one({"username": data["client_username"]})
 
-def connect_client(data):
-    user = users_tbl.find_one({"username": data["username"]})
+    if not client:
+        raise HTTPException(404, "Client not found")
 
-    if not user:
-        return {"error": "User not found"}
-
-    if user["unique_code"] != data["unique_code"]:
-        return {"error": "Invalid code"}
+    if client["unique_code"] != data["unique_code"]:
+        raise HTTPException(400, "Invalid code")
 
     users_tbl.update_one(
-        {"username": data["username"]},
-        {"$set": {"linked_client": data["client_username"]}}
+        {"_id": user["_id"]},
+        {"$set": {"linked_client": client["username"]}}
     )
 
-    return {"message": "Connected"}
+    return {"message": "Connected successfully"}
 
-
-def register_device(claims, data):
+# ---------- DEVICE ----------
+@app.post("/device")
+async def register_device(data: dict, user=Depends(get_current_user)):
     if not data.get("device_id") or not data.get("player_id"):
-        return {"error": "device_id and player_id required"}
+        raise HTTPException(400, "device_id & player_id required")
 
     devices_tbl.update_one(
-        {
-            "username": claims["username"],
-            "device_id": data.get("device_id")
-        },
+        {"device_id": data["device_id"]},
         {
             "$set": {
-                "username": claims["username"],
-                "device_id": data.get("device_id"),
-                "player_id": data.get("player_id"),  # 🔥 STORE THIS
-                "updated_at": now_iso()
+                "username": user["username"],
+                "player_id": data["player_id"],
+                "updated_at": now()
             }
         },
         upsert=True
     )
 
-    return {"message": "Device saved"}
-
+    return {"message": "Device registered"}
 
 # ---------- SOS ----------
-def trigger_sos(claims, data):
-    username = claims["username"]
-
-    user = users_tbl.find_one({"username": username})
-    client_username = user.get("linked_client")
-
-    if not client_username:
-        return {"error": "No client linked"}
+@app.post("/sos")
+async def trigger_sos(data: dict, background_tasks: BackgroundTasks, user=Depends(get_current_user)):
+    if not user.get("linked_client"):
+        raise HTTPException(400, "No trusted contact linked")
 
     alert_id = str(uuid.uuid4())
 
     alerts_tbl.insert_one({
         "alert_id": alert_id,
-        "user": username,
-        "client": client_username,
+        "user": user["username"],
+        "client": user["linked_client"],
         "status": "ACTIVE",
         "location": {
-            "lat": data.get("lat"),
-            "lng": data.get("lng")
+            "type": "Point",
+            "coordinates": [data.get("lng"), data.get("lat")]
         },
-        "created_at": now_iso()
+        "created_at": now()
     })
 
-    # 🔥 GET ALL DEVICES OF CLIENT
-    devices = devices_tbl.find({"username": client_username})
+    # fetch devices
+    devices = devices_tbl.find({"username": user["linked_client"]})
+    player_ids = [d["player_id"] for d in devices if d.get("player_id")]
 
-    player_ids = []
-    for d in devices:
-        if d.get("player_id"):
-            player_ids.append(d["player_id"])
-
-    # 🔥 SEND NOTIFICATION TO ALL DEVICES
-    if player_ids:
-        send_push_notification(
-            player_ids,
-            f"🚨 SOS Alert from {username}",
-            {
-                "alert_id": alert_id,
-                "lat": data.get("lat"),
-                "lng": data.get("lng"),
-                "type": "SOS"
-            }
-        )
+    # background notification
+    background_tasks.add_task(
+        send_push_notification,
+        player_ids,
+        f"🚨 SOS Alert from {user['username']}",
+        {
+            "alert_id": alert_id,
+            "lat": data.get("lat"),
+            "lng": data.get("lng"),
+            "type": "SOS"
+        }
+    )
 
     return {
-        "message": "SOS sent",
+        "message": "SOS triggered",
         "alert_id": alert_id,
-        "notified_devices": len(player_ids)
+        "devices_notified": len(player_ids)
     }
 
-# ---------- ROUTES ----------
-@app.post("/")
-async def root(request: Request):
-    try:
-        body = await request.json()
-    except:
-        return {"error": "Invalid JSON"}
-
-    headers = dict(request.headers)
-    return process_request(body, headers)
-
-
+# ---------- HEALTH ----------
 @app.get("/health")
 async def health():
     try:
-        client.admin.command('ping')
-        return {
-            "status": "ok",
-            "service": "womensafety-api",
-            "time": datetime.datetime.utcnow().isoformat()
-        }
+        client.admin.command("ping")
+        return {"status": "ok", "time": now()}
     except Exception as e:
-        return {
-            "status": "error",
-            "message": str(e)
-        }
-
+        return {"status": "error", "message": str(e)}
 
 @app.get("/")
-async def root_get():
-    return {"message": "API is running 🚀"}
+async def root():
+    return {"message": "Women Safety API running 🚀"}
